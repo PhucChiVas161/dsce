@@ -41,23 +41,27 @@
 	
 	trace(@"os version %d.%d.%d, subcache count %x",self.majorVersion,self.minorVersion,self.subMinorVersion,files.count);
 	
-	self.findMagicSel;
+	// The shared-cache-relative selector base was introduced after Big Sur.
+	if(self.majorVersion>=12) self.findMagicSel;
 	
 	return self;
 }
 
 -(int)majorVersion
 {
+	if(self.files[0].header->imagesCountOld) return 11;
 	return self.files[0].header->osVersion/0x10000;
 }
 
 -(int)minorVersion
 {
+	if(self.files[0].header->imagesCountOld) return 0;
 	return (self.files[0].header->osVersion/0x100)%0x100;
 }
 
 -(int)subMinorVersion
 {
+	if(self.files[0].header->imagesCountOld) return 0;
 	return self.files[0].header->osVersion%0x100;
 }
 

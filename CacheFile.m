@@ -12,9 +12,12 @@
 	
 	NSMutableArray<CacheImage*>* images=NSMutableArray.alloc.init.autorelease;
 	
-	struct dyld_cache_image_info* infos=(struct dyld_cache_image_info*)wrapOffset(self,self.header->imagesOffset).pointer;
+	// Big Sur predates the relocated imagesOffset/imagesCount header fields.
+	uint32_t imageOffset=self.header->imagesCountOld?self.header->imagesOffsetOld:self.header->imagesOffset;
+	uint32_t imageCount=self.header->imagesCountOld?self.header->imagesCountOld:self.header->imagesCount;
+	struct dyld_cache_image_info* infos=(struct dyld_cache_image_info*)wrapOffset(self,imageOffset).pointer;
 	
-	for(int index=0;index<self.header->imagesCount;index++)
+	for(int index=0;index<imageCount;index++)
 	{
 		CacheImage* image=[CacheImage.alloc initWithCacheFile:self info:&infos[index]].autorelease;
 		if(image)

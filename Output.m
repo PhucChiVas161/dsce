@@ -65,6 +65,7 @@ BOOL isAligned(long address,int amount)
 	
 	assert(image);
 	self.cacheImage=image;
+	self.legacySelectorRefAddresses=NSMutableSet.alloc.init.autorelease;
 	
 	return self;
 }
@@ -169,7 +170,8 @@ BOOL isAligned(long address,int amount)
 				
 				if(self.needsObjcImpostor&&!strcmp(command->segname,SEG_TEXT))
 				{
-					int impostorSize=sizeof(struct segment_command_64)+sizeof(struct section_64);
+					int sectionCount=self.cache.majorVersion==11?2:1;
+					int impostorSize=sizeof(struct segment_command_64)+sectionCount*sizeof(struct section_64);
 					
 					NSMutableData* impostorData=[NSMutableData dataWithLength:impostorSize];
 					
@@ -179,7 +181,7 @@ BOOL isAligned(long address,int amount)
 					memcpy(impostor->segname,IMPOSTOR_OBJC_TEMP,strlen(IMPOSTOR_OBJC_TEMP)+1);
 					impostor->maxprot=VM_PROT_READ;
 					impostor->initprot=VM_PROT_READ;
-					impostor->nsects=1;
+					impostor->nsects=sectionCount;
 					
 					[self.header addCommand:(struct load_command*)impostor];
 				}
@@ -325,6 +327,16 @@ BOOL isAligned(long address,int amount)
 			
 			memcpy(impostor->segname,SEG_DATA,strlen(SEG_DATA)+1);
 			memcpy(impostor->sectname,"__objc_imageinfo",16);
+			if(command->nsects==2)
+			{
+				struct section_64* names=impostor+1;
+				memcpy(names->segname,SEG_DATA,strlen(SEG_DATA)+1);
+				memcpy(names->sectname,"dsce.selstrings",15);
+				names->offset=impostor->offset+sizeof(objc_image_info);
+				names->addr=impostor->addr+sizeof(objc_image_info);
+				names->size=0x1000-sizeof(objc_image_info);
+				names->flags=S_CSTRING_LITERALS;
+			}
 			
 			trace(@"created fake __objc_imageinfo section");
 			
@@ -916,6 +928,7 @@ BOOL isAligned(long address,int amount)
 		refs[index]=[self selStringAddressWithName:name];
 		
 		long refAddress=wrapPointer(self,(char*)&refs[index]).address;
+		if(self.cache.majorVersion==11) [self.legacySelectorRefAddresses addObject:@(refAddress)];
 		self.sels[name].refAddress=refAddress;
 	}
 }
@@ -931,6 +944,21 @@ BOOL isAligned(long address,int amount)
 -(long)selStringAddressWithName:(NSString*)target
 {
 	Selector* sel=self.sels[target];
+	// Big Sur may coalesce all selector strings outside the image. Restore
+	// them into the unused part of our already allocated objc image-info page.
+	if(!sel&&self.cache.majorVersion==11)
+	{
+		struct section_64* info=[self.header sectionCommandWithName:(char*)"__objc_imageinfo"];
+		assert(info&&self.needsObjcImpostor);
+		NSData* bytes=[target dataUsingEncoding:NSUTF8StringEncoding];
+		NSUInteger offset=sizeof(objc_image_info)+self.legacySelectorBytes;
+		assert(offset+bytes.length+1<=0x1000);
+		memcpy(wrapOffset(self,info->offset+offset).pointer,bytes.bytes,bytes.length);
+		self.legacySelectorBytes+=bytes.length+1;
+		sel=Selector.alloc.init.autorelease;
+		sel.stringAddress=info->addr+offset;
+		self.sels[target]=sel;
+	}
 	assert(sel);
 	
 	return sel.stringAddress;
@@ -1127,6 +1155,7 @@ BOOL isAligned(long address,int amount)
 			NSString* name=[NSString stringWithUTF8String:wrapAddress(self.cache,(long)method->name).pointer];
 			
 			method->name=(char*)[self selStringAddressWithName:name];
+			if(self.cache.majorVersion==11) [self.legacySelectorRefAddresses addObject:@(wrapPointer(self,(char*)&method->name).address)];
 		}
 	}
 	
@@ -1167,7 +1196,9 @@ BOOL isAligned(long address,int amount)
 		
 		long destination=*(long*)wrapAddress(self,rebase.address).pointer;
 		
-		if(wrapAddressUnsafe(self,destination))
+		CacheImage* originalOwner=self.cache.majorVersion==11?[self.cache imageWithAddress:destination]:nil;
+		BOOL syntheticSelector=[self.legacySelectorRefAddresses containsObject:@(rebase.address)];
+		if(wrapAddressUnsafe(self,destination)&&(!originalOwner||originalOwner==self.cacheImage||syntheticSelector))
 		{
 			// internal pointer, only needs rebase
 			
@@ -1212,10 +1243,23 @@ BOOL isAligned(long address,int amount)
 			}
 			else
 			{
+				// Audited 20G1427 x86_64h: this Blocks descriptor's extended
+				// layout is an empty string coalesced into libobjc's __OBJC_RO.
+				if(self.cache.majorVersion==11&&rebase.address==0x7fff8cfd6e98&&
+				   destination==0x7fff7b38a68a&&
+				   [self.cacheImage.path isEqualToString:@"/System/Library/PrivateFrameworks/MTLCompiler.framework/Versions/3902/MTLCompiler"]&&
+				   *wrapAddress(self.cache,destination).pointer==0)
+				{
+					*(long*)wrapAddress(self,rebase.address).pointer=[self selStringAddressWithName:@""];
+					self.fixups[key]=rebase;
+					internalCount++;
+					continue;
+				}
 				// TODO: this should never happen...
 				// indicates either bugs, or a need for better addend heuristic?
 				
 				unresolvedCount++;
+				trace(@"unresolved pointer at %lx -> %lx in %@",rebase.address,destination,image.path);
 				continue;
 			}
 		}
@@ -1245,6 +1289,7 @@ BOOL isAligned(long address,int amount)
 	// TODO: may be worth creating a "strict" flag to abort on weird ones of these
 	
 	trace(@"found %lx binds (%lx via C++ hack), skipped %lx internal pointers, failed to find image containing %lx addresses, failed to resolve %lx addresses to symbols, failed to reach %lx dylibs in imports tree (%lx due to uniqued __got)",successCount,cppCount,internalCount,noImageCount,unresolvedCount,unreachableCount,unreachableGotCount);
+	if(self.cache.majorVersion==11) assert(!noImageCount&&!unresolvedCount&&!unreachableCount);
 }
 
 -(void)stepFixInitOffsets

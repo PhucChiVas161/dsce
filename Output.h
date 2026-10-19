@@ -1,5 +1,8 @@
 @interface Output:NSObject<LocationBase>
 
+@property(assign) NSUInteger legacySelectorBytes;
+@property(retain) NSMutableSet<NSNumber*>* legacySelectorRefAddresses;
+
 @property(assign) CacheSet* cache;
 @property(assign) CacheImage* cacheImage;
 @property(retain) ImageHeader* header;
